@@ -25,7 +25,8 @@ S3_BUCKET = os.environ["S3_BUCKET"]
 RANDOM_POOL_QUEUE_URL = os.environ["RANDOM_POOL_QUEUE_URL"]
 RANDOM_PHOTO_POOL_QUEUE_URL = os.environ["RANDOM_PHOTO_POOL_QUEUE_URL"]
 
-POOL_TARGET_SIZE = int(os.environ.get("POOL_TARGET_SIZE", "20"))
+POOL_LOW_WATERMARK = int(os.environ.get("POOL_LOW_WATERMARK", "15"))
+POOL_TARGET_SIZE = int(os.environ.get("POOL_TARGET_SIZE", "25"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))
 
 QUEUE_URL_BY_POOL = {
@@ -197,13 +198,17 @@ def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
 
 
 def fill_pool(pool_name: str) -> int:
-    """Top up a single pool queue. Returns number of previews added."""
+    """Top up a single pool queue. Returns number of previews added.
+
+    Only starts filling when count drops below POOL_LOW_WATERMARK (15).
+    Fills up to POOL_TARGET_SIZE (25).
+    """
     queue_url = QUEUE_URL_BY_POOL[pool_name]
     current = get_approximate_count(queue_url)
-    logger.info("pool '%s': %d / %d", pool_name, current, POOL_TARGET_SIZE)
+    logger.info("pool '%s': %d (low=%d, target=%d)", pool_name, current, POOL_LOW_WATERMARK, POOL_TARGET_SIZE)
 
-    if current >= POOL_TARGET_SIZE:
-        logger.info("pool '%s' at capacity — skipping", pool_name)
+    if current >= POOL_LOW_WATERMARK:
+        logger.info("pool '%s' above low watermark — skipping", pool_name)
         return 0
 
     needed = min(BATCH_SIZE, POOL_TARGET_SIZE - current)
