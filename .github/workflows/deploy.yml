@@ -1,0 +1,51 @@
+name: Deploy to Yandex Cloud Functions
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Yandex Cloud CLI
+        run: |
+          curl -sSL https://storage.yandexcloud.net/yandexcloud-yc/install.sh | bash -s -- -i /opt/yc -n
+          echo "/opt/yc/bin" >> $GITHUB_PATH
+
+      - name: Authenticate with service account key
+        run: |
+          echo '${{ secrets.YC_SA_KEY_JSON }}' > sa-key.json
+          yc config profile create deploy
+          yc config set service-account-key sa-key.json
+          yc config set folder-id ${{ secrets.YC_FOLDER_ID }}
+          echo "YC_SA_ID=$(jq -r .service_account_id sa-key.json)" >> $GITHUB_ENV
+          rm sa-key.json
+
+      - name: Create deployment package
+        run: zip -r function.zip index.py ids.txt requirements.txt
+
+      - name: Get Lockbox secret version
+        run: |
+          VERSION_ID=$(yc lockbox secret get ${{ secrets.LOCKBOX_SECRET_ID }} --format json | jq -r '.current_version.id')
+          echo "LOCKBOX_VERSION_ID=$VERSION_ID" >> $GITHUB_ENV
+
+      - name: Deploy to Cloud Functions
+        run: |
+          yc serverless function version create \
+            --function-name=epstein-file-pool-filler \
+            --runtime=python314 \
+            --entrypoint=index.handler \
+            --memory=384m \
+            --execution-timeout=300s \
+            --source-path=function.zip \
+            --service-account-id=$YC_SA_ID \
+            --secret environment-variable=AWS_ACCESS_KEY_ID,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=AWS_ACCESS_KEY_ID \
+            --secret environment-variable=AWS_SECRET_ACCESS_KEY,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=AWS_SECRET_ACCESS_KEY \
+            --secret environment-variable=S3_BUCKET,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=S3_BUCKET \
+            --secret environment-variable=RANDOM_POOL_QUEUE_URL,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=RANDOM_POOL_QUEUE_URL \
+            --secret environment-variable=RANDOM_PHOTO_POOL_QUEUE_URL,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=RANDOM_PHOTO_POOL_QUEUE_URL
