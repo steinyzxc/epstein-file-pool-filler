@@ -27,8 +27,8 @@ DUMP_CHAT_ID = os.environ["DUMP_CHAT_ID"]  # private channel for caching files
 RANDOM_POOL_QUEUE_URL = os.environ["RANDOM_POOL_QUEUE_URL"]
 RANDOM_PHOTO_POOL_QUEUE_URL = os.environ["RANDOM_PHOTO_POOL_QUEUE_URL"]
 
-POOL_LOW_WATERMARK = int(os.environ.get("POOL_LOW_WATERMARK", "15"))
-POOL_TARGET_SIZE = int(os.environ.get("POOL_TARGET_SIZE", "25"))
+POOL_LOW_WATERMARK = int(os.environ.get("POOL_LOW_WATERMARK", "25"))
+POOL_TARGET_SIZE = int(os.environ.get("POOL_TARGET_SIZE", "35"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))
 
 QUEUE_URL_BY_POOL = {
