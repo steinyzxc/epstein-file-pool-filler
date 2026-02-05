@@ -46,6 +46,7 @@ jobs:
             --service-account-id=$YC_SA_ID \
             --secret environment-variable=AWS_ACCESS_KEY_ID,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=AWS_ACCESS_KEY_ID \
             --secret environment-variable=AWS_SECRET_ACCESS_KEY,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=AWS_SECRET_ACCESS_KEY \
-            --secret environment-variable=S3_BUCKET,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=S3_BUCKET \
+            --secret environment-variable=BOT_TOKEN,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=BOT_TOKEN \
+            --secret environment-variable=DUMP_CHAT_ID,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=DUMP_CHAT_ID \
             --secret environment-variable=RANDOM_POOL_QUEUE_URL,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=RANDOM_POOL_QUEUE_URL \
             --secret environment-variable=RANDOM_PHOTO_POOL_QUEUE_URL,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=RANDOM_PHOTO_POOL_QUEUE_URL

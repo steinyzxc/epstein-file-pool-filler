@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import logging
 import random
@@ -19,8 +20,9 @@ AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
 YMQ_ENDPOINT = os.environ.get(
     "YMQ_ENDPOINT", "https://message-queue.api.cloud.yandex.net"
 )
-S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "https://storage.yandexcloud.net")
-S3_BUCKET = os.environ["S3_BUCKET"]
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+DUMP_CHAT_ID = os.environ["DUMP_CHAT_ID"]  # private channel for caching files
 
 RANDOM_POOL_QUEUE_URL = os.environ["RANDOM_POOL_QUEUE_URL"]
 RANDOM_PHOTO_POOL_QUEUE_URL = os.environ["RANDOM_PHOTO_POOL_QUEUE_URL"]
@@ -35,19 +37,11 @@ QUEUE_URL_BY_POOL = {
 }
 
 # ---------------------------------------------------------------------------
-# AWS-compatible clients (Yandex Cloud)
+# SQS client (Yandex Message Queue)
 # ---------------------------------------------------------------------------
 _sqs = boto3.client(
     "sqs",
     endpoint_url=YMQ_ENDPOINT,
-    region_name="ru-central1",
-    aws_access_key_id=AWS_ACCESS_KEY_ID,
-    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-)
-
-_s3 = boto3.client(
-    "s3",
-    endpoint_url=S3_ENDPOINT,
     region_name="ru-central1",
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
@@ -83,7 +77,7 @@ IDS_BY_DATASET = load_ids_from_file()
 AVAILABLE_DATASETS = list(IDS_BY_DATASET.keys())
 
 # ---------------------------------------------------------------------------
-# PDF fetching / conversion helpers (mirror of bot logic)
+# PDF fetching / conversion helpers
 # ---------------------------------------------------------------------------
 
 def get_random_epstein_doc_url(
@@ -137,6 +131,65 @@ def pdf_first_page_to_jpeg(pdf_bytes: bytes) -> bytes | None:
         return None
 
 # ---------------------------------------------------------------------------
+# Telegram upload — send photo to dump channel, get file_id back
+# ---------------------------------------------------------------------------
+
+def upload_photo_to_telegram(jpeg_bytes: bytes, caption: str) -> str | None:
+    """Send photo to dump channel via Telegram API, return file_id.
+
+    Returns the file_id of the largest photo size, or None on failure.
+    """
+    try:
+        boundary = "----FormBoundary" + uuid4().hex[:16]
+        body = io.BytesIO()
+
+        body.write(f"--{boundary}\r\n".encode())
+        body.write(b'Content-Disposition: form-data; name="chat_id"\r\n\r\n')
+        body.write(f"{DUMP_CHAT_ID}\r\n".encode())
+
+        body.write(f"--{boundary}\r\n".encode())
+        body.write(b'Content-Disposition: form-data; name="caption"\r\n\r\n')
+        body.write(f"{caption}\r\n".encode())
+
+        body.write(f"--{boundary}\r\n".encode())
+        body.write(b'Content-Disposition: form-data; name="parse_mode"\r\n\r\n')
+        body.write(b"Markdown\r\n")
+
+        body.write(f"--{boundary}\r\n".encode())
+        body.write(b'Content-Disposition: form-data; name="photo"; filename="page.jpg"\r\n')
+        body.write(b"Content-Type: image/jpeg\r\n\r\n")
+        body.write(jpeg_bytes)
+        body.write(b"\r\n")
+
+        body.write(f"--{boundary}--\r\n".encode())
+
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+        req = urllib.request.Request(
+            url,
+            data=body.getvalue(),
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+
+        if not result.get("ok"):
+            logger.error("sendPhoto not ok: %s", result)
+            return None
+
+        # photo array sorted by size — last element is the largest
+        photos = result["result"].get("photo", [])
+        if not photos:
+            logger.error("sendPhoto returned no photo sizes")
+            return None
+
+        return photos[-1]["file_id"]
+
+    except Exception as e:
+        logger.error("upload_photo_to_telegram failed: %s", e)
+        return None
+
+# ---------------------------------------------------------------------------
 # Pool management
 # ---------------------------------------------------------------------------
 
@@ -149,7 +202,7 @@ def get_approximate_count(queue_url: str) -> int:
 
 
 def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
-    """Generate one preview and push it to the pool queue.
+    """Generate one preview, upload to Telegram, enqueue file_id.
 
     Retries up to 7 random documents before giving up.
     Returns True on success.
@@ -169,18 +222,14 @@ def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
             logger.warning("attempt %d: convert failed for %s", attempt + 1, file_id)
             continue
 
-        # Unique key to avoid overwrites from concurrent invocations
-        s3_key = f"previews/{pool_name}/{file_id}-{uuid4().hex[:8]}.jpg"
-
-        _s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=s3_key,
-            Body=jpeg_bytes,
-            ContentType="image/jpeg",
-        )
+        caption = f"[{file_id}]({url})"
+        tg_file_id = upload_photo_to_telegram(jpeg_bytes, caption)
+        if not tg_file_id:
+            logger.warning("attempt %d: telegram upload failed for %s", attempt + 1, file_id)
+            continue
 
         message = {
-            "s3_key": s3_key,
+            "tg_file_id": tg_file_id,
             "original_url": url,
             "file_id": file_id,
             "dataset": ds,
@@ -190,7 +239,7 @@ def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
             MessageBody=json.dumps(message),
         )
 
-        logger.info("enqueued %s → %s pool", file_id, pool_name)
+        logger.info("enqueued %s → %s pool (tg_file_id cached)", file_id, pool_name)
         return True
 
     logger.error("gave up generating preview for %s pool after 7 attempts", pool_name)
@@ -200,8 +249,8 @@ def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
 def fill_pool(pool_name: str) -> int:
     """Top up a single pool queue. Returns number of previews added.
 
-    Only starts filling when count drops below POOL_LOW_WATERMARK (15).
-    Fills up to POOL_TARGET_SIZE (25).
+    Only starts filling when count drops below POOL_LOW_WATERMARK.
+    Fills up to POOL_TARGET_SIZE.
     """
     queue_url = QUEUE_URL_BY_POOL[pool_name]
     current = get_approximate_count(queue_url)
@@ -235,8 +284,6 @@ def handler(event, context):
     2. HTTP / timer trigger — no messages, fills all pools.
     """
     if "messages" in event:
-        # Deduplicate: if multiple refill-requests arrived for the same pool
-        # in one batch, fill once per unique pool name.
         pools_to_fill: set[str] = set()
         for msg in event["messages"]:
             body = json.loads(msg["details"]["message"]["body"])
