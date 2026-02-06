@@ -219,16 +219,18 @@ def download_pdf(url: str) -> bytes | None:
         return None
 
 
-def pdf_first_page_to_jpeg(pdf_bytes: bytes) -> bytes | None:
+def pdf_first_page_to_jpeg(pdf_bytes: bytes) -> tuple[bytes, int] | None:
+    """Return (jpeg_bytes, page_count) or None on failure."""
     import fitz  # PyMuPDF — lazy import to keep cold start fast
 
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        pages = len(doc)
         page = doc[0]
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
         jpeg_bytes = pix.tobytes("jpeg", jpg_quality=75)
         doc.close()
-        return jpeg_bytes
+        return jpeg_bytes, pages
     except Exception as e:
         logger.error("pdf_first_page_to_jpeg failed: %s", e)
         return None
@@ -300,22 +302,29 @@ def upload_photo_to_telegram(jpeg_bytes: bytes, caption: str) -> str | None:
 #   CREATE TABLE file_cache (
 #       doc_id Utf8,
 #       tg_file_id Utf8,
+#       pages Int32,
 #       PRIMARY KEY (doc_id)
 #   );
+#
+#   Migration (add pages column):
+#     ALTER TABLE file_cache ADD COLUMN pages Int32;
 
-def _cache_get(file_id: str) -> str | None:
-    """Return cached tg_file_id or None."""
+def _cache_get(file_id: str) -> tuple[str, int | None] | None:
+    """Return (tg_file_id, pages) or None."""
     def _q(session):
         result = session.transaction(ydb.SerializableReadWrite()).execute(
             session.prepare(
                 "DECLARE $doc_id AS Utf8;\n"
-                "SELECT tg_file_id FROM file_cache WHERE doc_id = $doc_id;"
+                "SELECT tg_file_id, pages FROM file_cache WHERE doc_id = $doc_id;"
             ),
             {"$doc_id": file_id},
             commit_tx=True,
         )
         rows = result[0].rows
-        return rows[0].tg_file_id if rows else None
+        if not rows:
+            return None
+        row = rows[0]
+        return row.tg_file_id, getattr(row, "pages", None)
 
     try:
         return _ydb_pool.retry_operation_sync(_q)
@@ -324,17 +333,18 @@ def _cache_get(file_id: str) -> str | None:
         return None
 
 
-def _cache_put(file_id: str, tg_file_id: str):
-    """Store tg_file_id in cache."""
+def _cache_put(file_id: str, tg_file_id: str, pages: int | None = None):
+    """Store tg_file_id and pages in cache."""
     def _q(session):
         session.transaction(ydb.SerializableReadWrite()).execute(
             session.prepare(
                 "DECLARE $doc_id AS Utf8;\n"
                 "DECLARE $tg_file_id AS Utf8;\n"
-                "UPSERT INTO file_cache (doc_id, tg_file_id)\n"
-                "VALUES ($doc_id, $tg_file_id);"
+                "DECLARE $pages AS Int32?;\n"
+                "UPSERT INTO file_cache (doc_id, tg_file_id, pages)\n"
+                "VALUES ($doc_id, $tg_file_id, $pages);"
             ),
-            {"$doc_id": file_id, "$tg_file_id": tg_file_id},
+            {"$doc_id": file_id, "$tg_file_id": tg_file_id, "$pages": pages},
             commit_tx=True,
         )
 
@@ -369,13 +379,14 @@ def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
 
     for attempt in range(7):
         url, file_id, ds = get_random_epstein_doc_url(dataset=dataset)
+        pages = None
 
         # Fast path: check cache
         cached = _cache_get(file_id)
         if cached:
             _cache_hits += 1
             logger.info("cache hit for %s", file_id)
-            tg_file_id = cached
+            tg_file_id, pages = cached
         else:
             _cache_misses += 1
             # Slow path: download → convert → upload to Telegram
@@ -384,18 +395,21 @@ def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
                 logger.warning("attempt %d: download failed for %s", attempt + 1, file_id)
                 continue
 
-            jpeg_bytes = pdf_first_page_to_jpeg(pdf_bytes)
-            if not jpeg_bytes:
+            result = pdf_first_page_to_jpeg(pdf_bytes)
+            if not result:
                 logger.warning("attempt %d: convert failed for %s", attempt + 1, file_id)
                 continue
+            jpeg_bytes, pages = result
 
             caption = f"[{file_id}]({url})"
+            if pages is not None:
+                caption += f" ({pages} p.)"
             tg_file_id = upload_photo_to_telegram(jpeg_bytes, caption)
             if not tg_file_id:
                 logger.warning("attempt %d: telegram upload failed for %s", attempt + 1, file_id)
                 continue
 
-            _cache_put(file_id, tg_file_id)
+            _cache_put(file_id, tg_file_id, pages)
 
         message = {
             "tg_file_id": tg_file_id,
@@ -403,6 +417,8 @@ def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
             "file_id": file_id,
             "dataset": ds,
         }
+        if pages is not None:
+            message["pages"] = pages
         _sqs.send_message(
             QueueUrl=queue_url,
             MessageBody=json.dumps(message),
