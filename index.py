@@ -7,6 +7,7 @@ import urllib.request
 from uuid import uuid4
 
 import boto3
+import ydb
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -20,6 +21,9 @@ AWS_SECRET_ACCESS_KEY = os.environ["AWS_SECRET_ACCESS_KEY"]
 YMQ_ENDPOINT = os.environ.get(
     "YMQ_ENDPOINT", "https://message-queue.api.cloud.yandex.net"
 )
+
+YDB_ENDPOINT = os.environ["YDB_ENDPOINT"]
+YDB_DATABASE = os.environ["YDB_DATABASE"]
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DUMP_CHAT_ID = os.environ["DUMP_CHAT_ID"]  # private channel for caching files
@@ -46,6 +50,17 @@ _sqs = boto3.client(
     aws_access_key_id=AWS_ACCESS_KEY_ID,
     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
 )
+
+# ---------------------------------------------------------------------------
+# YDB Serverless (file_id cache)
+# ---------------------------------------------------------------------------
+_ydb_driver = ydb.Driver(
+    endpoint=YDB_ENDPOINT,
+    database=YDB_DATABASE,
+    credentials=ydb.iam.MetadataUrlCredentials(),
+)
+_ydb_driver.wait(fail_fast=True, timeout=5)
+_ydb_pool = ydb.SessionPool(_ydb_driver)
 
 # ---------------------------------------------------------------------------
 # Dataset loading (shared with the bot — same ids.txt format)
@@ -190,6 +205,58 @@ def upload_photo_to_telegram(jpeg_bytes: bytes, caption: str) -> str | None:
         return None
 
 # ---------------------------------------------------------------------------
+# tg_file_id cache (YDB Serverless)
+# ---------------------------------------------------------------------------
+#
+# Table DDL (run once):
+#   CREATE TABLE file_cache (
+#       doc_id Utf8,
+#       tg_file_id Utf8,
+#       PRIMARY KEY (doc_id)
+#   );
+
+def _cache_get(file_id: str) -> str | None:
+    """Return cached tg_file_id or None."""
+    def _q(session):
+        result = session.transaction(ydb.SerializableReadWrite()).execute(
+            session.prepare(
+                "DECLARE $doc_id AS Utf8;\n"
+                "SELECT tg_file_id FROM file_cache WHERE doc_id = $doc_id;"
+            ),
+            {"$doc_id": file_id},
+            commit_tx=True,
+        )
+        rows = result[0].rows
+        return rows[0].tg_file_id if rows else None
+
+    try:
+        return _ydb_pool.retry_operation_sync(_q)
+    except Exception as e:
+        logger.warning("_cache_get(%s) failed: %s", file_id, e)
+        return None
+
+
+def _cache_put(file_id: str, tg_file_id: str):
+    """Store tg_file_id in cache."""
+    def _q(session):
+        session.transaction(ydb.SerializableReadWrite()).execute(
+            session.prepare(
+                "DECLARE $doc_id AS Utf8;\n"
+                "DECLARE $tg_file_id AS Utf8;\n"
+                "UPSERT INTO file_cache (doc_id, tg_file_id)\n"
+                "VALUES ($doc_id, $tg_file_id);"
+            ),
+            {"$doc_id": file_id, "$tg_file_id": tg_file_id},
+            commit_tx=True,
+        )
+
+    try:
+        _ydb_pool.retry_operation_sync(_q)
+    except Exception as e:
+        logger.warning("_cache_put(%s) failed: %s", file_id, e)
+
+
+# ---------------------------------------------------------------------------
 # Pool management
 # ---------------------------------------------------------------------------
 
@@ -204,6 +271,8 @@ def get_approximate_count(queue_url: str) -> int:
 def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
     """Generate one preview, upload to Telegram, enqueue file_id.
 
+    Checks YDB cache first — if the document was processed before,
+    reuses the cached tg_file_id (skips download/convert/upload).
     Retries up to 7 random documents before giving up.
     Returns True on success.
     """
@@ -212,21 +281,30 @@ def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
     for attempt in range(7):
         url, file_id, ds = get_random_epstein_doc_url(dataset=dataset)
 
-        pdf_bytes = download_pdf(url)
-        if not pdf_bytes:
-            logger.warning("attempt %d: download failed for %s", attempt + 1, file_id)
-            continue
+        # Fast path: check cache
+        cached = _cache_get(file_id)
+        if cached:
+            logger.info("cache hit for %s", file_id)
+            tg_file_id = cached
+        else:
+            # Slow path: download → convert → upload to Telegram
+            pdf_bytes = download_pdf(url)
+            if not pdf_bytes:
+                logger.warning("attempt %d: download failed for %s", attempt + 1, file_id)
+                continue
 
-        jpeg_bytes = pdf_first_page_to_jpeg(pdf_bytes)
-        if not jpeg_bytes:
-            logger.warning("attempt %d: convert failed for %s", attempt + 1, file_id)
-            continue
+            jpeg_bytes = pdf_first_page_to_jpeg(pdf_bytes)
+            if not jpeg_bytes:
+                logger.warning("attempt %d: convert failed for %s", attempt + 1, file_id)
+                continue
 
-        caption = f"[{file_id}]({url})"
-        tg_file_id = upload_photo_to_telegram(jpeg_bytes, caption)
-        if not tg_file_id:
-            logger.warning("attempt %d: telegram upload failed for %s", attempt + 1, file_id)
-            continue
+            caption = f"[{file_id}]({url})"
+            tg_file_id = upload_photo_to_telegram(jpeg_bytes, caption)
+            if not tg_file_id:
+                logger.warning("attempt %d: telegram upload failed for %s", attempt + 1, file_id)
+                continue
+
+            _cache_put(file_id, tg_file_id)
 
         message = {
             "tg_file_id": tg_file_id,
@@ -239,7 +317,7 @@ def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
             MessageBody=json.dumps(message),
         )
 
-        logger.info("enqueued %s → %s pool (tg_file_id cached)", file_id, pool_name)
+        logger.info("enqueued %s → %s pool", file_id, pool_name)
         return True
 
     logger.error("gave up generating preview for %s pool after 7 attempts", pool_name)
