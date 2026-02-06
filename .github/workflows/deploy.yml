@@ -51,4 +51,5 @@ jobs:
             --secret environment-variable=RANDOM_POOL_QUEUE_URL,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=RANDOM_POOL_QUEUE_URL \
             --secret environment-variable=RANDOM_PHOTO_POOL_QUEUE_URL,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=RANDOM_PHOTO_POOL_QUEUE_URL \
             --secret environment-variable=YDB_ENDPOINT,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=YDB_ENDPOINT \
-            --secret environment-variable=YDB_DATABASE,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=YDB_DATABASE
+            --secret environment-variable=YDB_DATABASE,id=${{ secrets.LOCKBOX_SECRET_ID }},version-id=$LOCKBOX_VERSION_ID,key=YDB_DATABASE \
+            --environment YC_FOLDER_ID=${{ secrets.YC_FOLDER_ID }}

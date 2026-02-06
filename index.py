@@ -28,6 +28,8 @@ YDB_DATABASE = os.environ["YDB_DATABASE"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 DUMP_CHAT_ID = os.environ["DUMP_CHAT_ID"]  # private channel for caching files
 
+YC_FOLDER_ID = os.environ.get("YC_FOLDER_ID", "")
+
 RANDOM_POOL_QUEUE_URL = os.environ["RANDOM_POOL_QUEUE_URL"]
 RANDOM_PHOTO_POOL_QUEUE_URL = os.environ["RANDOM_PHOTO_POOL_QUEUE_URL"]
 
@@ -61,6 +63,80 @@ _ydb_driver = ydb.Driver(
 )
 _ydb_driver.wait(fail_fast=True, timeout=5)
 _ydb_pool = ydb.SessionPool(_ydb_driver)
+
+# ---------------------------------------------------------------------------
+# Yandex Monitoring — custom metrics
+# ---------------------------------------------------------------------------
+_cache_hits = 0
+_cache_misses = 0
+
+
+def _get_iam_token() -> str | None:
+    """Get IAM token from metadata service (available in cloud functions)."""
+    try:
+        req = urllib.request.Request(
+            "http://169.254.169.254/computeMetadata/v1/instance"
+            "/service-accounts/default/token",
+            headers={"Metadata-Flavor": "Google"},
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read())["access_token"]
+    except Exception:
+        return None
+
+
+def _flush_metrics():
+    """Send cache hit/miss counters to Yandex Monitoring."""
+    global _cache_hits, _cache_misses
+
+    if (_cache_hits + _cache_misses) == 0 or not YC_FOLDER_ID:
+        _cache_hits = _cache_misses = 0
+        return
+
+    token = _get_iam_token()
+    if not token:
+        _cache_hits = _cache_misses = 0
+        return
+
+    metrics = {
+        "metrics": [
+            {
+                "name": "cache.hits",
+                "labels": {"service": "pool-filler"},
+                "type": "COUNTER",
+                "value": _cache_hits,
+            },
+            {
+                "name": "cache.misses",
+                "labels": {"service": "pool-filler"},
+                "type": "COUNTER",
+                "value": _cache_misses,
+            },
+        ],
+    }
+
+    try:
+        url = (
+            "https://monitoring.api.cloud.yandex.net"
+            f"/monitoring/v2/data/write?folderId={YC_FOLDER_ID}&service=custom"
+        )
+        data = json.dumps(metrics).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            resp.read()
+        logger.info("metrics: hits=%d misses=%d", _cache_hits, _cache_misses)
+    except Exception as e:
+        logger.warning("_flush_metrics failed: %s", e)
+    finally:
+        _cache_hits = _cache_misses = 0
+
 
 # ---------------------------------------------------------------------------
 # Dataset loading (shared with the bot — same ids.txt format)
@@ -276,6 +352,7 @@ def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
     Retries up to 7 random documents before giving up.
     Returns True on success.
     """
+    global _cache_hits, _cache_misses
     dataset = 2 if pool_name == "random_photo" else None
 
     for attempt in range(7):
@@ -284,9 +361,11 @@ def generate_and_enqueue(pool_name: str, queue_url: str) -> bool:
         # Fast path: check cache
         cached = _cache_get(file_id)
         if cached:
+            _cache_hits += 1
             logger.info("cache hit for %s", file_id)
             tg_file_id = cached
         else:
+            _cache_misses += 1
             # Slow path: download → convert → upload to Telegram
             pdf_bytes = download_pdf(url)
             if not pdf_bytes:
@@ -376,10 +455,12 @@ def handler(event, context):
         if pools_to_fill:
             for pool_name in pools_to_fill:
                 fill_pool(pool_name)
+            _flush_metrics()
             return {"statusCode": 200, "body": "ok"}
 
     # HTTP / timer trigger — refill everything
     for pool_name in QUEUE_URL_BY_POOL:
         fill_pool(pool_name)
 
+    _flush_metrics()
     return {"statusCode": 200, "body": "ok"}
