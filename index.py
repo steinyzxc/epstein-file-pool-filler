@@ -364,15 +364,19 @@ def handler(event, context):
     if "messages" in event:
         pools_to_fill: set[str] = set()
         for msg in event["messages"]:
-            body = json.loads(msg["details"]["message"]["body"])
-            pool = body.get("pool", "random")
-            if pool in QUEUE_URL_BY_POOL:
-                pools_to_fill.add(pool)
+            try:
+                body = json.loads(msg["details"]["message"]["body"])
+                pool = body.get("pool", "random")
+                if pool in QUEUE_URL_BY_POOL:
+                    pools_to_fill.add(pool)
+            except (KeyError, TypeError, json.JSONDecodeError):
+                logger.warning("skipping malformed message: %s", msg)
+                continue
 
-        for pool_name in pools_to_fill:
-            fill_pool(pool_name)
-
-        return {"statusCode": 200, "body": "ok"}
+        if pools_to_fill:
+            for pool_name in pools_to_fill:
+                fill_pool(pool_name)
+            return {"statusCode": 200, "body": "ok"}
 
     # HTTP / timer trigger — refill everything
     for pool_name in QUEUE_URL_BY_POOL:
