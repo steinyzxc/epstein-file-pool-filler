@@ -89,17 +89,26 @@ def _flush_metrics():
     """Send cache hit/miss counters to Yandex Monitoring."""
     global _cache_hits, _cache_misses
 
-    if (_cache_hits + _cache_misses) == 0 or not YC_FOLDER_ID:
+    total = _cache_hits + _cache_misses
+    if total == 0 or not YC_FOLDER_ID:
         _cache_hits = _cache_misses = 0
         return
 
     token = _get_iam_token()
     if not token:
+        logger.warning("no IAM token — skipping metrics")
         _cache_hits = _cache_misses = 0
         return
 
+    hit_rate = _cache_hits / total
     metrics = {
         "metrics": [
+            {
+                "name": "cache.hit_rate",
+                "labels": {"function": "pool-filler"},
+                "type": "DGAUGE",
+                "value": hit_rate,
+            },
             {
                 "name": "cache.hits",
                 "labels": {"service": "pool-filler"},
@@ -108,7 +117,7 @@ def _flush_metrics():
             },
             {
                 "name": "cache.misses",
-                "labels": {"service": "pool-filler"},
+                "labels": {"function": "pool-filler"},
                 "type": "COUNTER",
                 "value": _cache_misses,
             },
@@ -131,7 +140,10 @@ def _flush_metrics():
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             resp.read()
-        logger.info("metrics: hits=%d misses=%d", _cache_hits, _cache_misses)
+        logger.info(
+            "metrics sent: hits=%d misses=%d rate=%.2f",
+            _cache_hits, _cache_misses, hit_rate,
+        )
     except Exception as e:
         logger.warning("_flush_metrics failed: %s", e)
     finally:
