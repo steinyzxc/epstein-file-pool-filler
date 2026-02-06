@@ -111,7 +111,7 @@ def _flush_metrics():
             },
             {
                 "name": "cache.hits",
-                "labels": {"service": "pool-filler"},
+                "labels": {"function": "pool-filler"},
                 "type": "COUNTER",
                 "value": _cache_hits,
             },
